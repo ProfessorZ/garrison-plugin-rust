@@ -8,6 +8,7 @@ Protocol: JSON messages with Identifier, Message, Name fields.
 import asyncio
 import json
 import logging
+import re
 from typing import Optional
 
 try:
@@ -16,7 +17,7 @@ try:
 except ImportError:
     websockets = None
 
-from app.plugins.base import GamePlugin, PlayerInfo
+from app.plugins.base import GamePlugin, PlayerInfo, ServerStatus, CommandDef
 
 logger = logging.getLogger(__name__)
 
@@ -28,7 +29,6 @@ class RustPlugin(GamePlugin):
     """Rust dedicated server plugin using WebSocket RCON."""
 
     custom_connection = True
-    game_type = "rust"
 
     def __init__(self):
         super().__init__()
@@ -40,6 +40,14 @@ class RustPlugin(GamePlugin):
         self._lock = asyncio.Lock()
         self._pending: dict[int, asyncio.Future] = {}
         self._listener_task: Optional[asyncio.Task] = None
+
+    @property
+    def game_type(self) -> str:
+        return "rust"
+
+    @property
+    def display_name(self) -> str:
+        return "Rust"
 
     # ------------------------------------------------------------------
     # Connection lifecycle
@@ -109,19 +117,16 @@ class RustPlugin(GamePlugin):
                     if not fut.done():
                         fut.set_result(data)
                 else:
-                    # Broadcast / server messages
                     logger.debug("Unhandled RCON message id=%s: %s", identifier, data.get("Message", "")[:200])
         except ConnectionClosed:
             logger.warning("Rust RCON WebSocket connection closed")
         except WebSocketException as exc:
             logger.error("WebSocket error: %s", exc)
         finally:
-            # Fail all pending futures
             for fut in self._pending.values():
                 if not fut.done():
                     fut.set_exception(ConnectionError("RCON connection lost"))
             self._pending.clear()
-            # Schedule reconnect
             asyncio.create_task(self._reconnect())
 
     async def send_command_custom(self, command: str, content: str = "") -> str:
@@ -155,38 +160,63 @@ class RustPlugin(GamePlugin):
             raise
 
     # ------------------------------------------------------------------
-    # GamePlugin interface
+    # GamePlugin abstract interface
     # ------------------------------------------------------------------
 
-    async def get_players(self) -> list[PlayerInfo]:
-        """Return list of currently connected players."""
-        raw = await self.send_command_custom("playerlist")
+    async def parse_players(self, raw_response: str) -> list[PlayerInfo]:
+        """Parse JSON playerlist response."""
         try:
-            players_data = json.loads(raw)
+            players_data = json.loads(raw_response)
         except (json.JSONDecodeError, TypeError):
-            logger.warning("playerlist returned non-JSON: %s", raw)
+            logger.warning("parse_players got non-JSON: %s", raw_response)
             return []
 
         players = []
         for p in players_data:
             players.append(PlayerInfo(
-                player_id=str(p.get("SteamID", "")),
                 name=p.get("DisplayName") or p.get("Username", "Unknown"),
-                ping=int(p.get("Ping", 0)),
-                extra={
-                    "health": p.get("Health"),
-                    "connected_seconds": p.get("ConnectedSeconds"),
-                    "voip": p.get("VoiP"),
-                },
+                steam_id=str(p.get("SteamID", "")),
             ))
         return players
+
+    async def get_status(self, send_command) -> ServerStatus:
+        """Get server status via WebSocket RCON."""
+        try:
+            raw = await self.send_command_custom("status")
+            # Parse player count from status output
+            # e.g. "players : 3 (100 max) (3 sleepers) (0 joining) (0 queued)"
+            player_count = 0
+            m = re.search(r"players\s*:\s*(\d+)", raw, re.IGNORECASE)
+            if m:
+                player_count = int(m.group(1))
+            version = None
+            mv = re.search(r"version\s*:\s*(\S+)", raw, re.IGNORECASE)
+            if mv:
+                version = mv.group(1)
+            return ServerStatus(online=True, player_count=player_count, version=version)
+        except Exception as exc:
+            logger.warning("get_status failed: %s", exc)
+            return ServerStatus(online=False)
+
+    def get_commands(self) -> list[CommandDef]:
+        from schema import get_commands
+        return get_commands()
+
+    # ------------------------------------------------------------------
+    # Optional overrides
+    # ------------------------------------------------------------------
+
+    async def get_players(self, send_command) -> list[PlayerInfo]:
+        """Return list of currently connected players."""
+        raw = await self.send_command_custom("playerlist")
+        return await self.parse_players(raw)
 
     async def get_server_info(self) -> dict:
         """Return basic server status info."""
         status_raw = await self.send_command_custom("status")
         return {"status": status_raw}
 
-    async def kick_player(self, player_id: str, reason: str = "Kicked by admin") -> bool:
+    async def kick_player(self, send_command, player_id: str, reason: str = "Kicked by admin") -> bool:
         """Kick a player by SteamID."""
         cmd = f'kick {player_id} "{reason}"'
         try:
@@ -196,9 +226,8 @@ class RustPlugin(GamePlugin):
             logger.error("Kick failed: %s", exc)
             return False
 
-    async def ban_player(self, player_id: str, reason: str = "Banned by admin", duration: Optional[int] = None) -> bool:
+    async def ban_player(self, send_command, player_id: str, reason: str = "Banned by admin", duration: Optional[int] = None) -> bool:
         """Ban a player by SteamID."""
-        # Rust ban is permanent via banid; use duration-less ban
         cmd = f'banid {player_id} "" "{reason}"'
         try:
             await self.send_command_custom(cmd)
@@ -207,7 +236,7 @@ class RustPlugin(GamePlugin):
             logger.error("Ban failed: %s", exc)
             return False
 
-    async def unban_player(self, player_id: str) -> bool:
+    async def unban_player(self, send_command, player_id: str) -> bool:
         """Unban a player by SteamID."""
         cmd = f"unban {player_id}"
         try:
